@@ -1,43 +1,188 @@
-
-local EMBEDDED_CALIBRATION = (function()
-
-local function reach()
-    return {
-        horizontal=nil, up=nil, down=nil, reaction=nil,
-        correctionSpeed=nil, correctionDistance=nil,
-        uncertainty=nil, uncertaintyRate=nil, accelerationUncertainty=nil,
-        jumpSpeed=nil, jumpGravity=nil, jumpDelay=nil,
-        diveSpeed=nil, diveDistance=nil, diveDelay=nil, diveDuration=nil,
-        allowJumpDive=nil, allowAirDive=nil,
-    }
-end
-return {
-    calibration={id="",status="incomplete",source=""},
-    gravity=nil, launchOffset=nil, velocityInheritance=nil,
-    networkDelay=nil, releaseDelay=nil, -- seconds; networkDelay is ONE WAY, not RTT
-    powerSamples=nil, -- sorted {{power=40,speed=...}, ..., {power=95,speed=...}}
-    maxActorSpeed=nil, maxActorAcceleration=nil,
-    fieldMargin=nil, safetyMargin=nil,
-    bounds={xMin=nil,xMax=nil,zMin=nil,zMax=nil,minY=nil},
-    -- Required per role: horizontal, up, down, reaction, correctionSpeed,
-    -- correctionDistance, uncertainty, uncertaintyRate, accelerationUncertainty,
-    -- jumpSpeed, jumpGravity, jumpDelay, diveSpeed, diveDistance, diveDelay,
-    -- diveDuration, allowJumpDive, allowAirDive. Explicit zero disables an action/extension.
-    receiver=reach(), defender=reach(),
-    powers={40,50,60,70,80,95},
-    telemetry={authorized=false,capacity=512},
-}
-
-end)()
-
-local EMBEDDED_MODEL = nil
-
 local factories,cache={},{}
 local load
 load=function(name)
  if cache[name]~=nil then return cache[name] end
- assert(factories[name], 'Unknown module: '..name)
+ assert(factories[name],name)
  local value=factories[name](); cache[name]=value; return value
+end
+
+factories["Calibration"]=function()
+local U=load("Util")
+local Config=load("Config")
+local C={}
+ 
+ 
+function C.preset(observed)
+    local o=observed or {}; local missing={}
+    if o.placeId~=82866880824588 and o.placeId~=81310542478972 then return nil,"Game-specific KZ preset unavailable for this place" end
+    for _,key in ipairs({"playerGravity","receiverJumpSpeed","defenderJumpSpeed","walkSpeed","floorY","ballRadius","oneWayDelay"}) do
+        if not U.finite(o[key]) or (key~="floorY" and o[key]<0) then missing[#missing+1]=key end
+    end
+    if #missing>0 then return nil,"Missing observations: "..table.concat(missing,", ") end
+    local function reach(defender)
+        return {horizontal=2.75+(defender and 0.75*3 or 0),up=2.75+1.4*3,down=2,
+            reaction=defender and 0.12 or 0.08,correctionSpeed=defender and o.walkSpeed*0.12 or 0,
+            correctionDistance=defender and 6 or 0,uncertainty=0,uncertaintyRate=0,accelerationUncertainty=0,
+            jumpSpeed=defender and o.defenderJumpSpeed or o.receiverJumpSpeed,jumpGravity=o.playerGravity,jumpDelay=0,
+            diveSpeed=28,diveDistance=6,diveDelay=0,diveDuration=6/28,allowJumpDive=true,allowAirDive=true}
+    end
+    return {calibration={id="kz-legacy-approx-v1",status="approximate",verified=false,confidence=0,
+            source="original KZ unverified defaults + observed properties; RTT/2 is estimated",
+            placeId=o.placeId,uncertainty="unverified action/latency/field model; zero legacy uncertainty terms are NOT measured certainty"},allowEstimated=true,
+        gravity=28,launchOffset=5,velocityInheritance=0,networkDelay=o.oneWayDelay,releaseDelay=0,
+        powerSamples={{power=40,speed=40},{power=95,speed=95}},
+        maxActorSpeed=math.sqrt((math.max(40,o.walkSpeed)*1.5)^2+(math.max(o.receiverJumpSpeed,o.defenderJumpSpeed)+o.playerGravity*7)^2),
+        maxActorAcceleration=o.playerGravity+40,fieldMargin=0,safetyMargin=0.5*3,
+        bounds={xMin=-72,xMax=72,zMin=-172,zMax=172,minY=o.floorY+o.ballRadius},receiver=reach(false),defender=reach(true),
+        offsets={{x=0,y=0,z=0}},autoPlacement=true,
+        telemetry={authorized=false,capacity=64},maxCpuSeconds=0.06,sliceSeconds=0.0005,sliceWork=64}
+end
+local function solve(matrix,rhs)
+    local a={}; for i=1,3 do a[i]={matrix[i][1],matrix[i][2],matrix[i][3],rhs[i]} end
+    for i=1,3 do
+        local pivot=i; for j=i+1,3 do if math.abs(a[j][i])>math.abs(a[pivot][i]) then pivot=j end end
+        if math.abs(a[pivot][i])<1e-12 then return nil end
+        a[i],a[pivot]=a[pivot],a[i]; local divisor=a[i][i]
+        for j=i,4 do a[i][j]/=divisor end
+        for k=1,3 do if k~=i then local factor=a[k][i]; for j=i,4 do a[k][j]-=factor*a[i][j] end end end
+    end
+    return {a[1][4],a[2][4],a[3][4]}
+end
+function C.fit(record)
+    if type(record)~="table" or record.authorized~=true or record.freeFlight~=true or record.dataOrigin~="authorized-gameplay"
+        or type(record.id)~="string" or not U.finite(record.power) or record.power<40 or record.power>95
+        or not U.vec(record.qbVelocity) or not U.finite(record.inheritance) or record.inheritance<0 or record.inheritance>1
+        or not U.finite(record.positionError) or record.positionError<=0
+        or not U.array(record.samples,128) or #record.samples<5 then return nil,"invalid-or-unauthorized-record" end
+    local last=-1; local span=record.samples[#record.samples].t
+    if not U.finite(span) or span<=0 then return nil,"invalid-flight-times" end
+    local matrix={{0,0,0},{0,0,0},{0,0,0}}; local rhs={{0,0,0},{0,0,0},{0,0,0}}
+    for _,s in ipairs(record.samples) do
+        if not U.finite(s.t) or s.t<0 or s.t<=last or not U.vec(s.position) then return nil,"invalid-flight-times" end
+        last=s.t; local b={1,s.t/span,0.5*(s.t/span)^2}
+        for i=1,3 do
+            for j=1,3 do matrix[i][j]+=b[i]*b[j] end
+            rhs[1][i]+=b[i]*s.position.x; rhs[2][i]+=b[i]*s.position.y; rhs[3][i]+=b[i]*s.position.z
+        end
+    end
+    local x,y,z=solve(matrix,rhs[1]),solve(matrix,rhs[2]),solve(matrix,rhs[3])
+    if not x or not y or not z then return nil,"degenerate-flight" end
+    local p=U.v(x[1],y[1],z[1]); local v=U.v(x[2]/span,y[2]/span,z[2]/span)
+    local a=U.v(x[3]/span^2,y[3]/span^2,z[3]/span^2); local error2,maxError=0,0
+    for _,s in ipairs(record.samples) do
+        local predicted=U.add(U.add(p,U.mul(v,s.t)),U.mul(a,0.5*s.t*s.t)); local e=U.distance(predicted,s.position)
+        error2+=e*e; maxError=math.max(e,maxError)
+    end
+    local rms=math.sqrt(error2/#record.samples)
+    if a.y>=0 or maxError>record.positionError or math.sqrt(a.x*a.x+a.z*a.z)*span*span>6*record.positionError then
+        return nil,"non-ballistic-or-noisy-flight"
+    end
+    local speed=U.norm(U.sub(v,U.mul(record.qbVelocity,record.inheritance)))
+    if speed<=0 then return nil,"invalid-launch-speed" end
+    local velocityWeights=solve(matrix,{0,1,0}); local accelerationWeights=solve(matrix,{0,0,1})
+    local velocityBound,gravityBound=0,0
+    for _,s in ipairs(record.samples) do
+        local b={1,s.t/span,0.5*(s.t/span)^2}; local vw,aw=0,0
+        for i=1,3 do vw+=velocityWeights[i]*b[i]; aw+=accelerationWeights[i]*b[i] end
+        velocityBound+=math.abs(vw); gravityBound+=math.abs(aw)
+    end
+    return {gravity=-a.y,speed=speed,power=record.power,rms=rms,maxError=maxError,
+        uncertainty=record.positionError+maxError,samples=#record.samples,
+        gravityUncertainty=gravityBound*record.positionError/span^2,
+        speedUncertainty=math.sqrt(3)*velocityBound*record.positionError/span}
+end
+function C.new()
+    local self={mode="Preset",revision=0,flights={},seen={},movement={},accepted=0,rejected=0,manual=nil}
+    function self.setMode(mode)
+        if mode~="Preset" and mode~="Adaptive" and mode~="Measured" then return false,"unknown-calibration-mode" end
+        self.mode=mode; self.revision+=1; return true
+    end
+    function self.recordFlight(record)
+        local result,why=C.fit(record)
+        if not result or self.seen[record.id] then self.rejected+=1; return false,why or "duplicate-flight" end
+        self.seen[record.id]=true; self.flights[#self.flights+1]=result
+        if #self.flights>64 then table.remove(self.flights,1) end
+         
+        if self.accepted%128==127 then self.seen={[record.id]=true} end
+        self.accepted+=1; self.revision+=1; return true,result
+    end
+    function self.recordMovement(id,velocity,dt)
+        if not U.vec(velocity) or not U.finite(dt) or dt<=0 or dt>1 then return false end
+        local old=self.movement[id]
+        if not old then
+            local count=0; for _ in pairs(self.movement) do count+=1 end
+            if count>=128 then self.movement={} end
+        end
+        local acceleration=old and U.distance(old.velocity,velocity)/dt or 0
+        self.movement[id]={velocity=U.copy(velocity),acceleration=math.max(acceleration,old and old.acceleration or 0),count=old and old.count+1 or 1}
+        return true
+    end
+    function self.resolve(observed,measured)
+        local c,why
+        if self.mode=="Measured" then
+            c=U.copy(measured)
+            if type(c)~="table" or not c.calibration or c.calibration.status~="measured" then return nil,"Measured configuration unavailable" end
+            if c.calibration.placeId and c.calibration.placeId~=(observed or {}).placeId then return nil,"Measured configuration belongs to a different place" end
+        else
+            c,why=C.preset(observed); if not c then return nil,why end
+            if self.mode=="Adaptive" and #self.flights>0 then
+                local gravity,sumError,byPower,gravityError,speedError=0,0,{},0,0
+                for _,f in ipairs(self.flights) do
+                    gravity+=f.gravity; sumError+=f.rms
+                    gravityError=math.max(gravityError,f.gravityUncertainty); speedError=math.max(speedError,f.speedUncertainty)
+                    local bucket=byPower[f.power] or {}; byPower[f.power]=bucket; bucket[#bucket+1]=f.speed
+                end
+                gravity/=#self.flights
+                local spread=0; for _,f in ipairs(self.flights) do spread=math.max(spread,math.abs(f.gravity-gravity)) end
+                 
+                if #self.flights>=3 and gravityError+spread<gravity*0.5 then
+                    c.gravity=gravity
+                    local powers={}; for _,s in ipairs(c.powerSamples) do powers[s.power]=s.speed end
+                    for power,bucket in pairs(byPower) do
+                        if #bucket>=3 then local sum=0; for _,v in ipairs(bucket) do sum+=v end; powers[power]=sum/#bucket end
+                    end
+                    local samples={}; for power,speed in pairs(powers) do samples[#samples+1]={power=power,speed=speed} end
+                    table.sort(samples,function(a,b) return a.power<b.power end)
+                    local monotone=true; for i=2,#samples do if samples[i].speed<samples[i-1].speed then monotone=false end end
+                    if monotone then c.powerSamples=samples end
+                    c.calibration.status="estimated"; c.calibration.id="kz-adaptive-"..self.revision
+                    c.calibration.confidence=#self.flights/(#self.flights+8)/(1+sumError/#self.flights)
+                    c.calibration.source="authorized flight fits + remaining approximate KZ preset; confidence is a heuristic score"
+                    c.calibration.gravityUncertainty=spread+gravityError
+                    c.calibration.speedUncertainty=speedError
+                    c.calibration.confidence/=(1+(gravityError/gravity)^2)
+                    c.receiver.accelerationUncertainty=gravityError+spread
+                    c.defender.accelerationUncertainty=gravityError+spread
+                    c.receiver.uncertaintyRate=speedError; c.defender.uncertaintyRate=speedError
+                end
+                c.calibration.acceptedFlights=#self.flights; c.calibration.rmsResidual=sumError/#self.flights
+            end
+            for _,m in pairs(self.movement) do
+                if self.mode=="Adaptive" then
+                    c.receiver.accelerationUncertainty=math.max(c.receiver.accelerationUncertainty,m.acceleration)
+                    c.defender.accelerationUncertainty=math.max(c.defender.accelerationUncertainty,m.acceleration)
+                    c.maxActorAcceleration=math.max(c.maxActorAcceleration,m.acceleration+c.receiver.jumpGravity)
+                end
+            end
+        end
+        if self.manual then
+            for key,value in pairs(self.manual) do
+                if key~="calibration" and key~="allowSynthetic" and key~="allowEstimated" then c[key]=U.copy(value) end
+            end
+            if self.mode=="Measured" then return nil,"Manual overrides require a separately verified measured configuration" end
+            c.calibration.status="estimated"; c.calibration.verified=false
+            c.calibration.source..="; explicit unverified advanced overrides"
+        end
+        local prepared,reason=Config.prepare(c)
+        if not prepared then return nil,reason end
+        return prepared,{mode=self.mode,status=c.calibration.status,confidence=c.calibration.confidence,
+            verified=c.calibration.status=="measured",accepted=self.accepted,rejected=self.rejected,
+            uncertainty=c.calibration.uncertainty or "See measurement provenance and configured uncertainty envelopes"}
+    end
+    return self
+end
+return C
+
 end
 
 factories["Config"]=function()
@@ -59,7 +204,10 @@ function C.prepare(input)
     for k,v in pairs(defaults) do if c[k]==nil then c[k]=U.copy(v) end end
     if type(c.calibration)~="table" or type(c.calibration.id)~="string" or c.calibration.id==""
         or type(c.calibration.source)~="string" or c.calibration.source=="" then return nil,"calibration-provenance-required" end
-    if c.calibration.status~="measured" and not (c.calibration.status=="synthetic" and c.allowSynthetic==true) then
+    local estimated=(c.calibration.status=="approximate" or c.calibration.status=="estimated")
+        and c.allowEstimated==true and c.calibration.verified==false
+        and U.finite(c.calibration.confidence) and c.calibration.confidence>=0 and c.calibration.confidence<=1
+    if c.calibration.status~="measured" and not estimated and not (c.calibration.status=="synthetic" and c.allowSynthetic==true) then
         return nil,"measured-calibration-required"
     end
     local ok,key=nonnegative(c,{"gravity","launchOffset","velocityInheritance","networkDelay","releaseDelay",
@@ -164,6 +312,48 @@ return C
 
 end
 
+factories["Controls"]=function()
+local U=load("Util")
+local C={}
+function C.new()
+    local state={mode="Auto SmartFit",forward=0,side=0,strength=1,height=0,arc="Automatic",
+        angleMode="Automatic",angle=22,angleDelta=0,power=55,autoPower=true,revision=0}
+    local function set(key,value) if state[key]~=value then state[key]=value; state.revision+=1 end end
+    function state.set(key,value)
+        if key=="mode" then
+            if value~="Auto SmartFit" and value~="SmartFit + Manual Adjustments" and value~="Manual QB" then return false end
+        elseif key=="arc" then if value~="Automatic" and value~="High" and value~="Low" then return false end
+        elseif key=="angleMode" then if value~="Automatic" and value~="Absolute" and value~="Offset" then return false end
+        elseif key=="autoPower" then if type(value)~="boolean" then return false end
+        else
+            local ranges={forward={-30,30},side={-30,30},strength={0,3},height={-20,30},angle={-80,85},angleDelta={-45,45},power={40,95}}
+            local r=ranges[key]; if not r or not U.finite(value) then return false end
+            value=math.clamp(value,r[1],r[2])
+        end
+        set(key,value); return true
+    end
+    function state.resetLead() set("forward",0); set("side",0); set("strength",1) end
+    function state.resetHeight() set("height",0); set("arc","Automatic"); set("angleMode","Automatic"); set("angleDelta",0) end
+    return state
+end
+function C.intent(state,snapshot,recommendation)
+    local out={mode=state.mode,power=state.power,autoPower=state.autoPower,arc=state.arc}
+    if state.mode=="Auto SmartFit" then return {mode=state.mode,autoPower=true,arc="Automatic",offset=U.v()} end
+    local forward=U.unit(U.v(snapshot.receiver.velocity.x,0,snapshot.receiver.velocity.z))
+    if U.norm(forward)<0.5 then forward=U.unit(U.v(snapshot.receiver.position.x-snapshot.qb.position.x,0,snapshot.receiver.position.z-snapshot.qb.position.z)) end
+    if U.norm(forward)<0.5 then forward=U.v(0,0,1) end
+     
+    local right=U.v(forward.z,0,-forward.x)
+    out.offset=U.add(U.mul(forward,state.forward*state.strength),U.mul(right,state.side*state.strength)); out.offset.y=state.height
+    if state.angleMode=="Absolute" then out.angle=math.rad(state.angle)
+    elseif state.angleMode=="Offset" then out.angle=(recommendation and recommendation.angle or math.rad(state.angle))+math.rad(state.angleDelta) end
+    if state.mode=="Manual QB" then out.autoPower=false end
+    return out
+end
+return C
+
+end
+
 factories["Defense"]=function()
 local Motion=load("Motion")
 local Physics=load("Physics")
@@ -189,7 +379,7 @@ function D.evaluate(solution,defenders,motions,c,tick)
             local horizontal=math.sqrt(dx*dx+dz*dz)
             local ballSpeed=math.max(Physics.speedAt(solution,lo),Physics.speedAt(solution,hi))
             local actorSpeed=Motion.speedBound(segments,solution.delay+lo,solution.delay+hi)
-            -- Lipschitz displacement bound applies across velocity-change boundaries too.
+             
             local movement=(ballSpeed+actorSpeed)*(hi-lo)*0.5
             local lowerMargin=math.max(horizontal-radius,dy-up,-dy-down)-movement
             if lowerMargin>0 then
@@ -236,6 +426,7 @@ function Engine.new(input)
     function engine.update(value,now)
         if closed then return false,"engine-closed" end
         local success,owned,reason=pcall(Config.snapshot,value,now,c)
+         
         version+=1; if active then active.cancel() end
         snapshot=nil
         if not success then return false,"invalid-observation:"..tostring(owned) end
@@ -255,6 +446,9 @@ function Engine.new(input)
         end
         if active then active.cancel() end
         local captured,jobVersion=snapshot,version
+         
+         
+         
         local sliceWorkBudget=math.max(1,math.floor(c.sliceWork/(1+#snapshot.defenders/32)))
         local diagnostics={status="running",evaluated=0,valid=0,work=0,slices=0,
             maxSliceSeconds=0,cpuSeconds=0,rejections={},ranking="deterministic",sliceWorkBudget=sliceWorkBudget}
@@ -298,6 +492,7 @@ function Engine.new(input)
         end
         active=job; return job
     end
+     
     function engine.solve(now,unixNow)
         local job,reason=engine.start(now,unixNow)
         if not job then return nil,{status="failed",reason=reason} end
@@ -410,6 +605,8 @@ end
 factories["Motion"]=function()
 local U=load("Util")
 local M={}
+ 
+ 
 function M.landingTime(actor,gravity)
     if actor.grounded then return 0 end
     local height=actor.position.y-actor.groundY
@@ -440,7 +637,7 @@ function M.segments(actor,horizon,gravity)
         end
         if finish>start then
             if landing then
-                -- Vertical flight/landing is independent of horizontal route plans.
+                 
                 p=U.v(p.x,start>=landing and actor.groundY or actor.position.y+actor.velocity.y*start-0.5*gravity*start*start,p.z)
                 v=U.v(v.x,start>=landing and 0 or actor.velocity.y-gravity*start,v.z)
                 a=U.v(a.x,start>=landing and 0 or -gravity,a.z)
@@ -467,6 +664,7 @@ function M.at(segments,t)
     local x,y,z,vx,vy,vz=M.coordinates(segments,t)
     return U.v(x,y,z),U.v(vx,vy,vz)
 end
+ 
 function M.coefficients(segment,delay)
     local dt=delay-segment.start
     return U.add(U.add(segment.position,U.mul(segment.velocity,dt)),U.mul(segment.acceleration,0.5*dt*dt)),
@@ -550,7 +748,7 @@ function P.intercepts(qbPosition,qbVelocity,segments,delay,power,speed,offset,c,
     table.sort(results,function(a,b) return a.flightTime<b.flightTime end)
     return results
 end
--- A quadratic path is exactly a cubic Bezier with endpoint derivatives / 3.
+ 
 function P.bezier(s)
     local t=s.flightTime; local last=P.position(s,t)
     return {s.origin,U.add(s.origin,U.mul(s.velocity,t/3)),
@@ -561,6 +759,9 @@ function P.bezierAt(points,u)
     return U.add(U.add(U.mul(points[1],v^3),U.mul(points[2],3*v*v*u)),
         U.add(U.mul(points[3],3*v*u*u),U.mul(points[4],u^3)))
 end
+ 
+ 
+ 
 function P.groundClear(s,minY,numericalTolerance)
     numericalTolerance=numericalTolerance or 0
     local t=s.flightTime
@@ -603,7 +804,213 @@ return P
 
 end
 
+factories["Planner"]=function()
+local U=load("Util")
+local Config=load("Config")
+local Search=load("Search")
+local Physics=load("Physics")
+local Motion=load("Motion")
+local Roots=load("Polynomial")
+local Reach=load("Reach")
+local Defense=load("Defense")
+local Model=load("Model")
+local Controls=load("Controls")
+local P={}
+local function envelope(solution,snapshot,context,c,tick)
+    local hard,why=Physics.inBounds(solution,c.bounds,c.fieldMargin,c.endpointTolerance)
+    if not hard then return false,why end
+    local center=Motion.at(context.receiver,context.delay+solution.flightTime)
+     
+    solution.offset=U.sub(solution.endpoint,center)
+    local receiver,receiverDetails=Reach.receiver(snapshot.receiver,center,solution.endpoint,solution.flightTime,context.delay+solution.flightTime,c.receiver)
+    local defense,defenseDetails=Defense.evaluate(solution,snapshot.defenders,context.defenders,c,tick)
+    solution.validation={receiver=receiverDetails,minimumMargin=defenseDetails.minimumMargin or -math.huge,
+        defense=defenseDetails,endpointError=0}
+    solution.safe=receiver and defense
+    solution.warnings={}
+    if not receiver then solution.warnings[#solution.warnings+1]="receiver-unreachable" end
+    if not defense then solution.warnings[#solution.warnings+1]=defenseDetails.reason end
+    solution.status=solution.safe and "valid" or "manual-unapproved"
+    return true
+end
+local function stamp(solution,snapshot,now,context,c)
+    solution.timestamp=snapshot.timestamp; solution.plannedAt=now; solution.releaseAt=context.timing.releaseAt
+    solution.calibrationId=c.calibration.id; solution.timing=U.copy(context.timing)
+    solution.timing.flightSeconds=solution.flightTime; solution.timing.catchAt=solution.releaseAt+solution.flightTime
+    solution.safe=solution.status=="valid"; solution.warnings=solution.warnings or {}
+    local actor=solution.validation.receiver
+    local center=Motion.at(context.receiver,context.delay+solution.flightTime)
+    solution.actualCatchHeight=solution.endpoint.y-center.y
+    local forward=U.unit(U.v(snapshot.receiver.velocity.x,0,snapshot.receiver.velocity.z))
+    if U.norm(forward)<0.5 then forward=U.unit(U.v(snapshot.receiver.position.x-snapshot.qb.position.x,0,snapshot.receiver.position.z-snapshot.qb.position.z)) end
+    if U.norm(forward)<0.5 then forward=U.v(0,0,1) end
+    solution.leadForward=U.dot(solution.offset,forward)
+    solution.leadSide=U.dot(solution.offset,U.v(forward.z,0,-forward.x))
+    if actor and actor.horizontalBudget then
+        local dy=solution.endpoint.y-center.y
+        solution.receiverMargin=math.min(actor.horizontalBudget-actor.horizontalGap,
+            c.receiver.up+(actor.jumpHeight or 0)-actor.uncertainty-dy,
+            c.receiver.down-actor.uncertainty+dy-(actor.jumpHeight or 0))
+    else solution.receiverMargin=-math.huge end
+    solution.calibrationStatus=c.calibration.status
+    solution.approved=solution.safe and c.calibration.status=="measured"
+    return solution
+end
+local function fixedAngle(snapshot,context,c,intent,tick,diagnostics)
+    local results={}; local angle=intent.angle
+    if not U.finite(angle) or angle<c.minAngle or angle>c.maxAngle then return results end
+    local inherited=U.mul(context.qbVelocity,c.velocityInheritance)
+    local powers=intent.autoPower and c.powers or {intent.power}
+    for _,power in ipairs(powers) do
+        if not tick() then break end
+        local speed=Config.speed(c,power); local vertical=math.sin(angle); local horizontal=math.cos(angle)
+        for _,segment in ipairs(context.receiver) do
+            local p,v,a=Motion.coefficients(segment,context.delay)
+            local coefficients={context.qbPosition.y+c.launchOffset*vertical-p.y-intent.offset.y,
+                speed*vertical+inherited.y-v.y,-c.gravity*0.5-a.y}
+            local lo,hi=math.max(c.minFlightTime,segment.start-context.delay),math.min(c.maxFlightTime,segment.finish-context.delay)
+            local times=Roots.roots(coefficients,lo,hi,tick)
+            local r=U.v(p.x+intent.offset.x-context.qbPosition.x,0,p.z+intent.offset.z-context.qbPosition.z)
+            local flatV=U.v(v.x-inherited.x,0,v.z-inherited.z); local flatA=U.v(a.x,0,a.z)
+            local cosine2=horizontal*horizontal; local d=c.launchOffset
+             
+             
+            local horizontalPolynomial={U.dot(r,r)-cosine2*d*d,2*U.dot(r,flatV)-2*cosine2*d*speed,
+                U.dot(flatV,flatV)+2*U.dot(r,flatA)-cosine2*speed*speed,2*U.dot(flatV,flatA),U.dot(flatA,flatA)}
+            for _,t in ipairs(Roots.roots(horizontalPolynomial,lo,hi,tick)) do
+                local duplicate=false; for _,old in ipairs(times) do if math.abs(old-t)<1e-7 then duplicate=true end end
+                if not duplicate then times[#times+1]=t end
+            end
+            for _,t in ipairs(times) do
+                if diagnostics.evaluated>=c.maxCandidates or not tick() then return results end
+                diagnostics.evaluated+=1
+                local target=U.add(Motion.at(context.receiver,context.delay+t),intent.offset)
+                local flat=U.v(target.x-context.qbPosition.x-inherited.x*t,0,target.z-context.qbPosition.z-inherited.z*t)
+                local yaw=U.unit(flat)
+                if U.norm(yaw)>0.5 then
+                    local direction=U.v(yaw.x*horizontal,vertical,yaw.z*horizontal)
+                    local solution={origin=U.add(context.qbPosition,U.mul(direction,c.launchOffset)),
+                        direction=direction,velocity=U.add(U.mul(direction,speed),inherited),acceleration=U.v(0,-c.gravity,0),
+                        angle=angle,power=power,speed=speed,flightTime=t,delay=context.delay,requestedOffset=U.copy(intent.offset)}
+                    solution.endpoint=Physics.position(solution,t); solution.intentEndpoint=target
+                    solution.manualAimError=U.distance(solution.endpoint,target)
+                    solution.controlsConflict=solution.manualAimError>c.endpointTolerance
+                    if envelope(solution,snapshot,context,c,tick) then results[#results+1]=solution end
+                end
+            end
+        end
+    end
+    return results
+end
+function P.start(snapshot,now,input,settings,artifact,unixNow)
+    local c,why=Config.prepare(input); if not c then return nil,why end
+    local owned; owned,why=Config.snapshot(snapshot,now,c); if not owned then return nil,why end
+    snapshot=owned; settings=U.copy(settings)
+    if c.autoPlacement then
+        local sampling=U.copy(c)
+        local forward=U.unit(U.v(snapshot.receiver.velocity.x,0,snapshot.receiver.velocity.z))
+        if U.norm(forward)<0.5 then forward=U.unit(U.v(snapshot.receiver.position.x-snapshot.qb.position.x,0,snapshot.receiver.position.z-snapshot.qb.position.z)) end
+        if U.norm(forward)<0.5 then forward=U.v(0,0,1) end
+        local distance=c.receiver.horizontal*0.5; local right=U.v(forward.z,0,-forward.x)
+         
+        sampling.offsets={U.v(),U.mul(forward,distance),U.v(0,c.receiver.up*0.5,0),
+            U.mul(right,distance),U.mul(right,-distance),U.mul(forward,-distance)}
+        c=U.freeze(sampling)
+    end
+    local canceled,exhausted=false,false
+    local diagnostics={status="running",evaluated=0,valid=0,work=0,slices=0,rejections={},ranking="deterministic",maxSliceSeconds=0,cpuSeconds=0}
+    local quota=math.max(1,math.floor(c.sliceWork/(1+#snapshot.defenders/32)))
+    local sliceStart,sliceOps=0,0; local result,recommendation
+    local function tick()
+        if canceled or exhausted then return false end
+        diagnostics.work+=1; sliceOps+=1
+        local elapsed=os.clock()-sliceStart
+        if diagnostics.work>=c.maxWork or diagnostics.cpuSeconds+elapsed>=c.maxCpuSeconds then exhausted=true; return false end
+        if sliceOps>=quota or elapsed>=c.sliceSeconds then coroutine.yield(); if canceled then return false end end
+        return true
+    end
+    local worker=coroutine.create(function()
+        local model=Model.load(artifact,unixNow,c.calibration.id)
+        local context=Search.context(snapshot,now,c)
+        if settings.mode~="Manual QB" then
+            recommendation=Search.run(snapshot,now,c,model,unixNow,tick,diagnostics)
+            if recommendation then stamp(recommendation,snapshot,now,context,c) end
+            if settings.mode=="Auto SmartFit" then result=recommendation; return end
+        end
+        if exhausted or canceled then return end
+        local intent=Controls.intent(settings,snapshot,recommendation)
+        local adjusted=U.copy(c)
+        adjusted.offsets={U.add(recommendation and recommendation.offset or U.v(),intent.offset)}
+        intent.offset=adjusted.offsets[1]
+        if not intent.autoPower then adjusted.powers={intent.power} end
+        adjusted.preferenceArc=intent.arc
+         
+        diagnostics.recommendedCandidates=diagnostics.evaluated; diagnostics.evaluated=0
+        if not intent.angle then
+            result=Search.run(snapshot,now,adjusted,model,unixNow,tick,diagnostics)
+            if result then stamp(result,snapshot,now,context,c) end
+        end
+        if not result and not exhausted then
+            local candidates={}
+            if intent.angle then candidates=fixedAngle(snapshot,context,adjusted,intent,tick,diagnostics)
+            else
+                for _,power in ipairs(adjusted.powers) do
+                    if not tick() then break end
+                    for _,candidate in ipairs(Physics.intercepts(context.qbPosition,context.qbVelocity,context.receiver,context.delay,
+                        power,Config.speed(c,power),intent.offset,adjusted,tick)) do
+                        if diagnostics.evaluated>=c.maxCandidates or not tick() then break end
+                        diagnostics.evaluated+=1
+                        if envelope(candidate,snapshot,context,adjusted,tick) then candidates[#candidates+1]=candidate end
+                    end
+                end
+            end
+            table.sort(candidates,function(a,b)
+                if a.safe~=b.safe then return a.safe end
+                if intent.angle and math.abs((a.manualAimError or 0)-(b.manualAimError or 0))>1e-8 then
+                    return (a.manualAimError or 0)<(b.manualAimError or 0)
+                end
+                if intent.arc=="High" and math.abs(a.angle-b.angle)>1e-8 then return a.angle>b.angle end
+                if intent.arc=="Low" and math.abs(a.angle-b.angle)>1e-8 then return a.angle<b.angle end
+                return a.flightTime<b.flightTime
+            end)
+            result=candidates[1]
+            if result then stamp(result,snapshot,now,context,c) end
+        end
+        if result then
+            result.requestedOffset=U.copy(intent.offset)
+            result.controlMode=settings.mode
+            result.lessSafe=not result.safe or (recommendation and (result.validation.minimumMargin<recommendation.validation.minimumMargin-1e-6
+                or result.receiverMargin<recommendation.receiverMargin-1e-6)) or false
+            result.recommendation=recommendation and {angle=recommendation.angle,power=recommendation.power,minimumMargin=recommendation.validation.minimumMargin} or nil
+            result.approved=result.approved and settings.mode~="Manual QB"
+        end
+    end)
+    local job={}
+    function job.cancel() canceled=true; result=nil end
+    function job.step()
+        if canceled then return true,nil,{status="canceled"} end
+        if coroutine.status(worker)~="dead" then
+            sliceStart=os.clock(); sliceOps=0
+            local ok,errorMessage=coroutine.resume(worker); local elapsed=os.clock()-sliceStart
+            diagnostics.cpuSeconds+=elapsed; diagnostics.slices+=1; diagnostics.maxSliceSeconds=math.max(diagnostics.maxSliceSeconds,elapsed)
+            if not ok then canceled=true; result=nil; diagnostics.error=tostring(errorMessage) end
+        end
+        local done=canceled or coroutine.status(worker)=="dead"
+        if done then
+            if canceled then diagnostics.status="error" elseif result then diagnostics.status="solved"
+            else diagnostics.status=exhausted and "budget-exhausted" or (settings.mode=="Auto SmartFit" and "no-safe-candidate" or "no-physical-candidate") end
+        end
+        return done,result and U.owned(result) or nil,U.owned(diagnostics)
+    end
+    return job
+end
+return P
+
+end
+
 factories["Polynomial"]=function()
+ 
+ 
 local R={}
 function R.eval(c,x) local v=0; for i=#c,1,-1 do v=v*x+c[i] end; return v end
 local function near(c,x)
@@ -656,6 +1063,8 @@ local function observationDelay(flightSeconds,observationSeconds)
         and observationSeconds>=flightSeconds-1e-9,"invalid-observation/flight-timeline")
     return math.max(0,observationSeconds-flightSeconds)
 end
+ 
+ 
 local function groundReady(actor,observationToRelease,s)
     if actor.grounded then return 0 end
     if not U.finite(actor.groundY) then return math.huge end
@@ -665,6 +1074,8 @@ function R.uncertainty(actor,settings,t)
     return (actor.uncertainty or 0)+settings.uncertainty+settings.uncertaintyRate*t
         +0.5*settings.accelerationUncertainty*t*t
 end
+ 
+ 
 local function jump(actor,time,s,observationToRelease)
     if s.jumpSpeed==0 then return 0,nil end
     local ready=groundReady(actor,observationToRelease,s)
@@ -693,6 +1104,7 @@ function R.receiver(actor,center,point,time,observationTime,s)
     for _,mode in ipairs({"Run","Jump","Dive","JumpDive"}) do
         local jumping=mode=="Jump" or mode=="JumpDive"
         local diving=mode=="Dive" or mode=="JumpDive"
+         
         if mode~="JumpDive" or s.allowJumpDive then
             local extent=diving and dive or 0
             if U.norm(dir)<0.5 then extent=0 end
@@ -722,8 +1134,8 @@ function R.receiver(actor,center,point,time,observationTime,s)
     end
     return false,best
 end
--- Defender envelopes deliberately overapproximate direction/action combinations.
--- A safety rejection can be conservative; acceptance must cover all configured actions.
+ 
+ 
 function R.defenderEnvelope(actor,t,observationTime,s)
     local delay=observationDelay(t,observationTime)
     local uncertainty=R.uncertainty(actor,s,observationTime)
@@ -734,6 +1146,55 @@ function R.defenderEnvelope(actor,t,observationTime,s)
     return s.horizontal+correction+dive+uncertainty,s.up+jumpHeight+uncertainty,s.down+uncertainty
 end
 return R
+
+end
+
+factories["RobloxAdapter"]=function()
+ 
+ 
+local Adapter={}
+function Adapter.vector(value) return {x=value.X,y=value.Y,z=value.Z} end
+local function frame(position,tangent,api)
+    local Vec=api.Vector3
+    if tangent.Magnitude<1e-10 then tangent=Vec.xAxis end
+    local right=tangent.Unit
+    local seed=math.abs(right:Dot(Vec.yAxis))<0.95 and Vec.yAxis or Vec.zAxis
+    local back=right:Cross(seed).Unit
+    local up=back:Cross(right).Unit
+    return api.CFrame.fromMatrix(position,right,up,back)
+end
+function Adapter.draw(Engine,beam,attachment0,attachment1,solution,api)
+    api=api or {Vector3=Vector3,CFrame=CFrame}
+    local function native(value) return api.Vector3.new(value.x,value.y,value.z) end
+    local p=Engine.trajectory.bezier(solution)
+    local a,b,c,d=native(p[1]),native(p[2]),native(p[3]),native(p[4])
+    attachment0.WorldCFrame=frame(a,b-a,api)
+    attachment1.WorldCFrame=frame(d,d-c,api)
+    beam.Attachment0=attachment0; beam.Attachment1=attachment1
+    beam.CurveSize0=(b-a).Magnitude
+    beam.CurveSize1=(d-c).Magnitude
+    beam.Enabled=true
+end
+return Adapter
+
+end
+
+factories["Runtime"]=function()
+local Engine=load("Engine")
+local Planner=load("Planner")
+local Adapter=load("RobloxAdapter")
+Engine.hostExtensionsVersion=1
+Engine.calibrationModes=load("Calibration")
+Engine.controls=load("Controls")
+Engine.plan=Planner.start
+function Engine.create(config,unixNow)
+    local engine,why=Engine.new(config or Engine.calibration)
+    if not engine then return nil,{status="failed",reason=why} end
+    local loaded,reason=engine.loadModel(Engine.embeddedModel,unixNow)
+    return engine,{status="ready",model=loaded and "learned" or "deterministic",modelReason=reason}
+end
+Engine.drawBeam=function(beam,a,b,solution) return Adapter.draw(Engine,beam,a,b,solution) end
+return Engine
 
 end
 
@@ -816,7 +1277,7 @@ function S.run(snapshot,now,c,model,unixNow,tick,diagnostics)
             solution.timestamp=snapshot.timestamp; solution.plannedAt=now
             solution.calibrationId=c.calibration.id
             solution.features=Features.extract(solution,snapshot,details)
-            -- Pure preference cost, not a probability estimate.
+             
             solution.deterministicScore=solution.flightTime+solution.power*0.001
                 -math.min(100,details.minimumMargin)*0.01
             candidates[#candidates+1]=solution
@@ -824,6 +1285,9 @@ function S.run(snapshot,now,c,model,unixNow,tick,diagnostics)
             diagnostics.rejections[details.reason]=(diagnostics.rejections[details.reason] or 0)+1
         end
     end
+     
+     
+     
     for round=0,#c.offsets-1 do
         if stop then break end
         for powerIndex,power in ipairs(c.powers) do
@@ -847,6 +1311,8 @@ function S.run(snapshot,now,c,model,unixNow,tick,diagnostics)
     end
     diagnostics.valid=#candidates; diagnostics.adaptiveCandidateBudget=budget
     if #candidates==0 then return nil end
+     
+     
     local learned=model~=nil
     for _,solution in ipairs(candidates) do
         local estimate,reason=Model.predict(model,solution.features,unixNow)
@@ -854,6 +1320,8 @@ function S.run(snapshot,now,c,model,unixNow,tick,diagnostics)
     end
     diagnostics.ranking=learned and "learned" or "deterministic"
     table.sort(candidates,function(a,b)
+        if c.preferenceArc=="High" and math.abs(a.angle-b.angle)>1e-8 then return a.angle>b.angle end
+        if c.preferenceArc=="Low" and math.abs(a.angle-b.angle)>1e-8 then return a.angle<b.angle end
         if learned then
             local sa=a.estimate.catchProbability-a.estimate.interceptionRisk
             local sb=b.estimate.catchProbability-b.estimate.interceptionRisk
@@ -917,6 +1385,8 @@ return T
 end
 
 factories["Training"]=function()
+ 
+ 
 local U=load("Util")
 local F=load("Features")
 local T={}
@@ -1062,7 +1532,8 @@ function T.train(records,options,tick)
     if not ok then return nil,tostring(result) end
     return result
 end
-
+ 
+ 
 function T.newJob(records,options)
     if options~=nil and type(options)~="table" then return nil,"training-options-required" end
     options=U.copy(options or {})
@@ -1115,7 +1586,7 @@ return T
 end
 
 factories["Util"]=function()
-
+ 
 local U = {}
 function U.finite(n) return type(n) == "number" and n == n and math.abs(n) < math.huge end
 function U.vec(v)
@@ -1154,45 +1625,4 @@ function U.owned(t) return U.freeze(U.copy(t)) end
 return U
 
 end
-
-factories["RobloxAdapter"]=function()
--- Roblox-only presentation adapter. Require the bundled Engine ModuleScript
--- in your own Studio project, then call Adapter.draw(Engine,...).
-local Adapter={}
-function Adapter.vector(value) return {x=value.X,y=value.Y,z=value.Z} end
-local function frame(position,tangent,api)
-    local Vec=api.Vector3
-    if tangent.Magnitude<1e-10 then tangent=Vec.xAxis end
-    local right=tangent.Unit
-    local seed=math.abs(right:Dot(Vec.yAxis))<0.95 and Vec.yAxis or Vec.zAxis
-    local back=right:Cross(seed).Unit
-    local up=back:Cross(right).Unit
-    return api.CFrame.fromMatrix(position,right,up,back)
-end
-function Adapter.draw(Engine,beam,attachment0,attachment1,solution,api)
-    api=api or {Vector3=Vector3,CFrame=CFrame}
-    local function native(value) return api.Vector3.new(value.x,value.y,value.z) end
-    local p=Engine.trajectory.bezier(solution)
-    local a,b,c,d=native(p[1]),native(p[2]),native(p[3]),native(p[4])
-    attachment0.WorldCFrame=frame(a,b-a,api)
-    attachment1.WorldCFrame=frame(d,d-c,api)
-    beam.Attachment0=attachment0; beam.Attachment1=attachment1
-    beam.CurveSize0=(b-a).Magnitude
-    beam.CurveSize1=(d-c).Magnitude
-    beam.Enabled=true
-end
-return Adapter
-
-end
-local SmartFit=load("Engine")
-SmartFit.calibration=EMBEDDED_CALIBRATION
-SmartFit.embeddedModel=EMBEDDED_MODEL
-SmartFit.drawBeam=function(beam,attachment0,attachment1,solution)
-    return load("RobloxAdapter").draw(SmartFit,beam,attachment0,attachment1,solution)
-end
-function SmartFit.create(config,unixNow)
-    local engine,reason=SmartFit.new(config or SmartFit.calibration)
-    if not engine then return nil,{status="failed",reason=reason} end
-    local loaded,modelReason=engine.loadModel(SmartFit.embeddedModel,unixNow)
-    return engine,{status="ready",model=loaded and "learned" or "deterministic",modelReason=modelReason}
-end
+return load("Runtime")
